@@ -10,8 +10,8 @@ pub fn build_dhcp_discover_packet(bytes: &[u8]) -> Message {
     msg
 }
 
-pub async fn listen() -> Result<(), Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind("0.0.0.0:67").await?;
+pub async fn listen(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let socket = UdpSocket::bind(addr).await?;
 
     let mut buf = vec![0u8; 1024];
 
