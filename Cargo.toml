@@ -1,0 +1,9 @@
+[package]
+name = "mini-dhcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dhcproto = "0.12.0"
+hyper = { version = "1.5.0", features = ["full"] }
+tokio = { version = "1.41.1", features = ["full"] }
