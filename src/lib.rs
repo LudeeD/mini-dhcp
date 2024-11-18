@@ -15,6 +15,8 @@ pub async fn listen(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut buf = vec![0u8; 1024];
 
+    socket.set_broadcast(true);
+
     loop {
         // Receive a packet
         let (len, addr) = socket.recv_from(&mut buf).await?;
