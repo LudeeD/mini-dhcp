@@ -1,1 +1,5 @@
 /target
+*.env
+*.db
+
+*.pcapng

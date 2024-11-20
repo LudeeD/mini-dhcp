@@ -5,5 +5,8 @@ edition = "2021"
 
 [dependencies]
 dhcproto = "0.12.0"
-hyper = { version = "1.5.0", features = ["full"] }
 tokio = { version = "1.41.1", features = ["full"] }
+sqlx = { version = "0.8", features = [ "runtime-tokio", "sqlite" ] }
+rand = "0.8.5"
+jiff = "0.1.14"
+anyhow = "1.0.93"
