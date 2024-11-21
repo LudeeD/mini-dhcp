@@ -1,4 +1,7 @@
 use anyhow::{anyhow, Context};
+use axum::extract::State;
+use axum::routing::get;
+use axum::{Json, Router};
 use dhcproto::v4::{
     Decodable, Decoder, DhcpOption, Encodable, Encoder, Message, MessageType, Opcode, OptionCode,
 };
@@ -6,10 +9,8 @@ use jiff::{ToSpan, Unit, Zoned};
 use rand::Rng;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use sqlx::Error;
-use std::fmt::format;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
-use std::time::Duration;
 use tokio::net::UdpSocket;
 
 #[derive(Debug)]
@@ -167,6 +168,7 @@ async fn build_dhcp_ack_packet(leases: &SqlitePool, request_message: Message) ->
     Some(ack)
 }
 
+#[derive(Clone)]
 pub struct MiniDHCPConfiguration {
     leases: SqlitePool,
 }
@@ -183,7 +185,9 @@ impl MiniDHCPConfiguration {
     }
 }
 
-pub async fn listen(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
+pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
+    println!("Starting DHCP listener on port 67...");
+
     let socket = UdpSocket::bind("0.0.0.0:67").await?;
     socket.set_broadcast(true)?;
     socket.bind_device(Some("enP8p1s0".as_bytes()))?;
@@ -230,4 +234,27 @@ pub async fn listen(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
             continue;
         }
     }
+}
+
+pub async fn start_info_server(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
+    let app = Router::new()
+        .route("/leases", get(get_leases_handler))
+        .with_state(config);
+
+    // run our app with hyper, listening globally on port 3000
+    let listener = tokio::net::TcpListener::bind("localhost:6767")
+        .await
+        .unwrap();
+    axum::serve(listener, app).await.unwrap();
+
+    Ok(())
+}
+
+async fn get_leases_handler(
+    State(state): State<MiniDHCPConfiguration>,
+) -> anyhow::Result<Json<Vec<Lease>>> {
+    let demo = Ipv4Addr::new(192, 168, 1, 150);
+    let leases = get_lease(&state.leases, &demo).await.unwrap();
+
+    Ok(Json(vec![leases]))
 }
