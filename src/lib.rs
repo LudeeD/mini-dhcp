@@ -167,13 +167,23 @@ async fn build_dhcp_ack_packet(leases: &SqlitePool, request_message: Message) ->
     Some(ack)
 }
 
-pub async fn listen() -> Result<(), Box<dyn std::error::Error>> {
-    let conn = SqliteConnectOptions::from_str("sqlite://dhcp.db")?.create_if_missing(true);
+pub struct MiniDHCPConfiguration {
+    leases: SqlitePool,
+}
 
-    let pool = SqlitePool::connect_with(conn).await?;
+impl MiniDHCPConfiguration {
+    pub async fn new() -> anyhow::Result<Self> {
+        let conn = SqliteConnectOptions::from_str("sqlite://dhcp.db")?.create_if_missing(true);
 
-    sqlx::migrate!("./db/migrations").run(&pool).await?;
+        let leases = SqlitePool::connect_with(conn).await?;
 
+        sqlx::migrate!("./db/migrations").run(&leases).await?;
+
+        Ok(Self { leases })
+    }
+}
+
+pub async fn listen(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:67").await?;
     socket.set_broadcast(true)?;
     socket.bind_device(Some("enP8p1s0".as_bytes()))?;
@@ -189,7 +199,7 @@ pub async fn listen() -> Result<(), Box<dyn std::error::Error>> {
         let options = decoded_message.opts();
 
         if options.has_msg_type(MessageType::Discover) {
-            let offer = build_dhcp_offer_packet(&pool, decoded_message);
+            let offer = build_dhcp_offer_packet(&config.leases, decoded_message);
 
             if let Some(offer) = offer.await {
                 println!("Sending {:#?}", offer);
@@ -205,7 +215,7 @@ pub async fn listen() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if options.has_msg_type(MessageType::Request) {
-            let ack = build_dhcp_ack_packet(&pool, decoded_message);
+            let ack = build_dhcp_ack_packet(&config.leases, decoded_message);
 
             if let Some(ack) = ack.await {
                 println!("Sending {:#?}", ack);
