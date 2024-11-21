@@ -97,7 +97,7 @@ async fn build_dhcp_offer_packet(
 
     let reply_opcode = Opcode::BootReply;
     offer.set_opcode(reply_opcode);
-    offer.set_xid(discover_message.xid()); // Transaction ID
+    offer.set_xid(discover_message.xid());
     offer.set_yiaddr(random_address);
     offer.set_siaddr(Ipv4Addr::new(192, 168, 1, 69));
     offer.set_flags(discover_message.flags());
@@ -114,9 +114,6 @@ async fn build_dhcp_offer_packet(
     offer
         .opts_mut()
         .insert(DhcpOption::SubnetMask(Ipv4Addr::new(255, 255, 255, 0)));
-    offer
-        .opts_mut()
-        .insert(DhcpOption::Router(vec![Ipv4Addr::new(192, 168, 1, 1)]));
     offer
         .opts_mut()
         .insert(DhcpOption::BroadcastAddr(Ipv4Addr::new(192, 168, 1, 255)));
@@ -164,8 +161,6 @@ async fn build_dhcp_ack_packet(leases: &SqlitePool, request_message: Message) ->
         .insert(DhcpOption::ServerIdentifier(Ipv4Addr::new(192, 168, 1, 69)));
     ack.opts_mut()
         .insert(DhcpOption::SubnetMask(Ipv4Addr::new(255, 255, 255, 0)));
-    ack.opts_mut()
-        .insert(DhcpOption::Router(vec![Ipv4Addr::new(192, 168, 1, 1)]));
     ack.opts_mut()
         .insert(DhcpOption::BroadcastAddr(Ipv4Addr::new(192, 168, 1, 255)));
 
