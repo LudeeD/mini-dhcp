@@ -29,9 +29,12 @@ async fn get_leases_handler(State(state): State<MiniDHCPConfiguration>) -> Json<
     let futures = leases.iter().map(|lease| {
         let ip = std::net::Ipv4Addr::from(lease.ip as u32);
         async move {
-            let is_online = tokio::net::TcpStream::connect(format!("{}:80", ip))
-                .await
-                .is_ok();
+            let is_online = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                tokio::net::TcpStream::connect(format!("{}:80", ip)),
+            )
+            .await
+            .is_ok();
             (ip, lease.client_id.clone(), is_online)
         }
     });
