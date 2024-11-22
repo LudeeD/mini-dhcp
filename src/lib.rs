@@ -55,7 +55,7 @@ async fn insert_lease(pool: &SqlitePool, ip: Ipv4Addr, client_id: &Vec<u8>) -> a
 async fn build_dhcp_offer_packet(
     leases: &SqlitePool,
     discover_message: Message,
-) -> Option<Message> {
+) -> anyhow::Result<Message> {
     let client_id = discover_message.chaddr().to_vec();
 
     // The client's current address as recorded in the client's current
@@ -67,7 +67,10 @@ async fn build_dhcp_offer_packet(
     // expired or released) binding, if that address is in the server's
     // pool of available addresses and not already allocated, ELSE
     let mut suggested_address = match db::get_ip_from_client_id(leases, &client_id).await {
-        Ok(address) => Some(address),
+        Ok(address) => {
+            println!("Client already has IP assigned: {:?}", address);
+            Some(address)
+        }
         _ => None,
     };
 
@@ -75,16 +78,13 @@ async fn build_dhcp_offer_packet(
     // address is valid and not already allocated, ELSE
     if suggested_address.is_none() {
         let requested_ip_address = discover_message.opts().get(OptionCode::RequestedIpAddress);
-        println!("Requested IP address: {:?}", requested_ip_address);
+        println!("Client requested IP address: {:?}", requested_ip_address);
         let requested_ip_address = match requested_ip_address {
             Some(DhcpOption::RequestedIpAddress(ip)) => ip,
-            _ => return None,
+            _ => return Err(anyhow::anyhow!("Requested IP address not found")),
         };
 
-        if !db::is_ip_assigned(leases, *requested_ip_address)
-            .await
-            .ok()?
-        {
+        if !db::is_ip_assigned(leases, *requested_ip_address).await? {
             suggested_address = Some(*requested_ip_address);
         }
     }
@@ -94,13 +94,15 @@ async fn build_dhcp_offer_packet(
         loop {
             let random_address = Ipv4Addr::new(192, 168, 1, rand::thread_rng().gen_range(100..200));
 
-            if !db::is_ip_assigned(leases, random_address).await.ok()? {
+            if !db::is_ip_assigned(leases, random_address).await? {
                 suggested_address = Some(random_address);
+                // insert the lease into the database
+                insert_lease(leases, random_address, &client_id).await?;
                 break;
             }
 
             if max_tries == 0 {
-                return None;
+                return Err(anyhow::anyhow!("Could not assign IP address"));
             } else {
                 max_tries = max_tries.saturating_sub(1);
             }
@@ -109,17 +111,12 @@ async fn build_dhcp_offer_packet(
 
     let suggested_address = match suggested_address {
         Some(address) => address,
-        None => return None,
+        None => return Err(anyhow::anyhow!("Could not assign IP address")),
     };
 
+    println!("Creating offer");
+
     let mut offer = Message::default();
-
-    let chaddr = discover_message.chaddr().to_owned();
-
-    // insert the lease into the database
-    insert_lease(leases, suggested_address, &chaddr)
-        .await
-        .ok()?;
 
     let reply_opcode = Opcode::BootReply;
     offer.set_opcode(reply_opcode);
@@ -144,7 +141,8 @@ async fn build_dhcp_offer_packet(
         .opts_mut()
         .insert(DhcpOption::BroadcastAddr(Ipv4Addr::new(192, 168, 1, 255)));
 
-    Some(offer)
+    println!("Offer: {:?}", offer);
+    Ok(offer)
 }
 
 async fn build_dhcp_ack_packet(leases: &SqlitePool, request_message: Message) -> Option<Message> {
@@ -232,14 +230,19 @@ async fn start_dhcp_server(config: MiniDHCPConfiguration) -> anyhow::Result<()> 
         if options.has_msg_type(MessageType::Discover) {
             let offer = build_dhcp_offer_packet(&config.leases, decoded_message);
 
-            if let Some(offer) = offer.await {
-                println!("Sending {:#?}", offer);
+            match offer.await {
+                Ok(offer) => {
+                    println!("Sending {:#?}", offer);
 
-                let mut buf = Vec::new();
-                let mut e = Encoder::new(&mut buf);
-                offer.encode(&mut e)?;
+                    let mut buf = Vec::new();
+                    let mut e = Encoder::new(&mut buf);
+                    offer.encode(&mut e)?;
 
-                socket.send_to(&buf, "192.168.1.255:68").await?;
+                    socket.send_to(&buf, "192.168.1.255:68").await?;
+                }
+                Err(e) => {
+                    println!("Error: {:?}", e);
+                }
             }
 
             continue;
