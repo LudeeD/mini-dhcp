@@ -79,14 +79,16 @@ async fn build_dhcp_offer_packet(
     if suggested_address.is_none() {
         let requested_ip_address = discover_message.opts().get(OptionCode::RequestedIpAddress);
         println!("Client requested IP address: {:?}", requested_ip_address);
-        let requested_ip_address = match requested_ip_address {
-            Some(DhcpOption::RequestedIpAddress(ip)) => ip,
-            _ => return Err(anyhow::anyhow!("Requested IP address not found")),
+        match requested_ip_address {
+            Some(DhcpOption::RequestedIpAddress(ip)) => {
+                if !db::is_ip_assigned(leases, *ip).await? {
+                    suggested_address = Some(*ip);
+                }
+            }
+            _ => {
+                println!("No requested IP address")
+            }
         };
-
-        if !db::is_ip_assigned(leases, *requested_ip_address).await? {
-            suggested_address = Some(*requested_ip_address);
-        }
     }
 
     if suggested_address.is_none() {
@@ -139,7 +141,10 @@ async fn build_dhcp_offer_packet(
         .insert(DhcpOption::SubnetMask(Ipv4Addr::new(255, 255, 255, 0)));
     offer
         .opts_mut()
-        .insert(DhcpOption::BroadcastAddr(Ipv4Addr::new(192, 168, 1, 255)));
+        .insert(DhcpOption::BroadcastAddr(Ipv4Addr::new(255, 255, 255, 255)));
+    offer
+        .opts_mut()
+        .insert(DhcpOption::Router(vec![Ipv4Addr::new(192, 168, 1, 69)]));
 
     println!("Offer: {:?}", offer);
     Ok(offer)
@@ -188,7 +193,9 @@ async fn build_dhcp_ack_packet(leases: &SqlitePool, request_message: Message) ->
     ack.opts_mut()
         .insert(DhcpOption::SubnetMask(Ipv4Addr::new(255, 255, 255, 0)));
     ack.opts_mut()
-        .insert(DhcpOption::BroadcastAddr(Ipv4Addr::new(192, 168, 1, 255)));
+        .insert(DhcpOption::BroadcastAddr(Ipv4Addr::new(255, 255, 255, 255)));
+    ack.opts_mut()
+        .insert(DhcpOption::Router(vec![Ipv4Addr::new(192, 168, 1, 69)]));
 
     Some(ack)
 }
@@ -238,7 +245,7 @@ async fn start_dhcp_server(config: MiniDHCPConfiguration) -> anyhow::Result<()> 
                     let mut e = Encoder::new(&mut buf);
                     offer.encode(&mut e)?;
 
-                    socket.send_to(&buf, "192.168.1.255:68").await?;
+                    socket.send_to(&buf, "255.255.255.255:68").await?;
                 }
                 Err(e) => {
                     println!("Error: {:?}", e);
@@ -249,6 +256,20 @@ async fn start_dhcp_server(config: MiniDHCPConfiguration) -> anyhow::Result<()> 
         }
 
         if options.has_msg_type(MessageType::Request) {
+            let server_identifier = options.get(OptionCode::ServerIdentifier);
+
+            match server_identifier {
+                Some(DhcpOption::ServerIdentifier(ip)) => {
+                    println!(
+                        "Request with server identifier {:?} in response to DHCPOFFER ",
+                        ip
+                    );
+                }
+                _ => {
+                    println!("No server identifier verify or extend existing lease");
+                }
+            }
+
             let ack = build_dhcp_ack_packet(&config.leases, decoded_message);
 
             if let Some(ack) = ack.await {
@@ -258,7 +279,7 @@ async fn start_dhcp_server(config: MiniDHCPConfiguration) -> anyhow::Result<()> 
                 let mut e = Encoder::new(&mut buf);
                 ack.encode(&mut e)?;
 
-                socket.send_to(&buf, "192.168.1.255:68").await?;
+                socket.send_to(&buf, "255.255.255.255:68").await?;
             }
 
             continue;
