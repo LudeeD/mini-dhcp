@@ -1,38 +1,33 @@
-use anyhow::{anyhow, Context};
-use axum::extract::State;
-use axum::routing::get;
-use axum::{Json, Router};
+use anyhow::Context;
 use dhcproto::v4::{
     Decodable, Decoder, DhcpOption, Encodable, Encoder, Message, MessageType, Opcode, OptionCode,
 };
 use jiff::{ToSpan, Unit, Zoned};
 use rand::Rng;
+use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
-use sqlx::Error;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 use tokio::net::UdpSocket;
+mod db;
+mod info;
 
 #[derive(Debug)]
 struct Lease {
     ip: i64,
-    client_id: Option<Vec<u8>>,
+    client_id: Vec<u8>,
     leased: bool,
     expires_at: i64,
     network: i64,
     probation: bool,
 }
 
-async fn is_ip_assigned(pool: &SqlitePool, ip: Ipv4Addr) -> Result<bool, sqlx::Error> {
-    let arg = u32::from(ip);
-    match sqlx::query_file!("./db/queries/select-by-ip.sql", arg)
-        .fetch_one(pool)
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(Error::RowNotFound) => Ok(false),
-        Err(e) => Err(e),
-    }
+#[derive(Debug, Serialize)]
+struct Client {
+    ip: Ipv4Addr,
+    client_id: String,
+    hostname: String,
+    online: bool,
 }
 
 async fn insert_lease(pool: &SqlitePool, ip: Ipv4Addr, client_id: &Vec<u8>) -> anyhow::Result<()> {
@@ -57,49 +52,79 @@ async fn insert_lease(pool: &SqlitePool, ip: Ipv4Addr, client_id: &Vec<u8>) -> a
     Ok(())
 }
 
-async fn get_lease(pool: &SqlitePool, ip: &Ipv4Addr) -> anyhow::Result<Lease> {
-    let arg = u32::from(ip.clone());
-    let lease = sqlx::query_file_as!(Lease, "./db/queries/select-by-ip.sql", arg)
-        .fetch_one(pool)
-        .await
-        .with_context(|| anyhow!("Failed to get lease"))?;
-
-    Ok(lease)
-}
-
 async fn build_dhcp_offer_packet(
     leases: &SqlitePool,
     discover_message: Message,
 ) -> Option<Message> {
-    let mut random_address;
+    let client_id = discover_message.chaddr().to_vec();
 
-    let mut max_tries: u8 = 10;
+    // The client's current address as recorded in the client's current
+    // binding
+    // The client's current address as recorded in the client's current
+    // binding, ELSE
+    //
+    // The client's previous address as recorded in the client's (now
+    // expired or released) binding, if that address is in the server's
+    // pool of available addresses and not already allocated, ELSE
+    let mut suggested_address = match db::get_ip_from_client_id(leases, &client_id).await {
+        Ok(address) => Some(address),
+        _ => None,
+    };
 
-    loop {
-        random_address = Ipv4Addr::new(192, 168, 1, rand::thread_rng().gen_range(100..200));
+    // The address requested in the 'Requested IP Address' option, if that
+    // address is valid and not already allocated, ELSE
+    if suggested_address.is_none() {
+        let requested_ip_address = discover_message.opts().get(OptionCode::RequestedIpAddress);
+        println!("Requested IP address: {:?}", requested_ip_address);
+        let requested_ip_address = match requested_ip_address {
+            Some(DhcpOption::RequestedIpAddress(ip)) => ip,
+            _ => return None,
+        };
 
-        if !is_ip_assigned(leases, random_address).await.ok()? {
-            break;
-        }
-
-        if max_tries == 0 {
-            return None;
-        } else {
-            max_tries = max_tries.saturating_sub(1);
+        if !db::is_ip_assigned(leases, *requested_ip_address)
+            .await
+            .ok()?
+        {
+            suggested_address = Some(*requested_ip_address);
         }
     }
+
+    if suggested_address.is_none() {
+        let mut max_tries: u8 = 10;
+        loop {
+            let random_address = Ipv4Addr::new(192, 168, 1, rand::thread_rng().gen_range(100..200));
+
+            if !db::is_ip_assigned(leases, random_address).await.ok()? {
+                suggested_address = Some(random_address);
+                break;
+            }
+
+            if max_tries == 0 {
+                return None;
+            } else {
+                max_tries = max_tries.saturating_sub(1);
+            }
+        }
+    }
+
+    let suggested_address = match suggested_address {
+        Some(address) => address,
+        None => return None,
+    };
 
     let mut offer = Message::default();
 
     let chaddr = discover_message.chaddr().to_owned();
 
     // insert the lease into the database
-    insert_lease(leases, random_address, &chaddr).await.ok()?;
+    insert_lease(leases, suggested_address, &chaddr)
+        .await
+        .ok()?;
 
     let reply_opcode = Opcode::BootReply;
     offer.set_opcode(reply_opcode);
     offer.set_xid(discover_message.xid());
-    offer.set_yiaddr(random_address);
+    offer.set_yiaddr(suggested_address);
     offer.set_siaddr(Ipv4Addr::new(192, 168, 1, 69));
     offer.set_flags(discover_message.flags());
     offer.set_giaddr(discover_message.giaddr());
@@ -141,9 +166,11 @@ async fn build_dhcp_ack_packet(leases: &SqlitePool, request_message: Message) ->
 
     let chaddr = request_message.chaddr().to_owned();
 
-    let lease = get_lease(leases, requested_ip_address).await.ok()?;
+    let lease = db::get_lease_by_ip(leases, *requested_ip_address)
+        .await
+        .ok()?;
 
-    if lease.client_id != Some(chaddr) {
+    if lease.client_id != chaddr {
         return None;
     }
 
@@ -185,7 +212,7 @@ impl MiniDHCPConfiguration {
     }
 }
 
-pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
+async fn start_dhcp_server(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
     println!("Starting DHCP listener on port 67...");
 
     let socket = UdpSocket::bind("0.0.0.0:67").await?;
@@ -236,25 +263,14 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
     }
 }
 
-pub async fn start_info_server(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
-    let app = Router::new()
-        .route("/leases", get(get_leases_handler))
-        .with_state(config);
+pub async fn start() -> anyhow::Result<()> {
+    let config = MiniDHCPConfiguration::new().await?;
 
-    // run our app with hyper, listening globally on port 3000
-    let listener = tokio::net::TcpListener::bind("localhost:6767")
-        .await
-        .unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let handle = tokio::spawn(start_dhcp_server(config.clone()));
+
+    tokio::spawn(info::start_info_server(config));
+
+    handle.await??;
 
     Ok(())
-}
-
-async fn get_leases_handler(
-    State(state): State<MiniDHCPConfiguration>,
-) -> anyhow::Result<Json<Vec<Lease>>> {
-    let demo = Ipv4Addr::new(192, 168, 1, 150);
-    let leases = get_lease(&state.leases, &demo).await.unwrap();
-
-    Ok(Json(vec![leases]))
 }

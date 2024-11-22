@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS leases(
     ip INTEGER NOT NULL,
-    client_id BLOB,
+    client_id BLOB NOT NULL,
     leased BOOLEAN NOT NULL DEFAULT 0,
     expires_at INTEGER NOT NULL,
     network INTEGER NOT NULL,
