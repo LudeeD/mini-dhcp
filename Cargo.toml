@@ -1,7 +1,10 @@
 [package]
 name = "mini-dhcp"
+description = "A minimalistic DHCP server"
 version = "0.1.0"
+license = "MIT"
 edition = "2021"
+authors = ["Luis Silva <luiscomsnofim@gmail.com>"]
 
 [dependencies]
 dhcproto = "0.12.0"
