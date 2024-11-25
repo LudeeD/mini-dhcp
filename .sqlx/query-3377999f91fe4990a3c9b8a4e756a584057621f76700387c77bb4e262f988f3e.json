@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT ip FROM leases WHERE client_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "ip",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3377999f91fe4990a3c9b8a4e756a584057621f76700387c77bb4e262f988f3e"
+}

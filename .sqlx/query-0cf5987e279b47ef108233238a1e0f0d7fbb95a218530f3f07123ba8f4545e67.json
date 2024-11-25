@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT * FROM leases WHERE ip = ? AND leased",
+  "describe": {
+    "columns": [
+      {
+        "name": "ip",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "client_id",
+        "ordinal": 1,
+        "type_info": "Blob"
+      },
+      {
+        "name": "leased",
+        "ordinal": 2,
+        "type_info": "Bool"
+      },
+      {
+        "name": "expires_at",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "network",
+        "ordinal": 4,
+        "type_info": "Integer"
+      },
+      {
+        "name": "probation",
+        "ordinal": 5,
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0cf5987e279b47ef108233238a1e0f0d7fbb95a218530f3f07123ba8f4545e67"
+}
