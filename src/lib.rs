@@ -10,7 +10,7 @@ use std::net::Ipv4Addr;
 use std::str::FromStr;
 use tokio::net::UdpSocket;
 mod db;
-mod info;
+pub mod info;
 
 #[derive(Debug)]
 struct Lease {
@@ -23,7 +23,7 @@ struct Lease {
 }
 
 #[derive(Debug, Serialize)]
-struct Client {
+pub struct Client {
     ip: Ipv4Addr,
     client_id: String,
     hostname: String,
@@ -217,7 +217,7 @@ impl MiniDHCPConfiguration {
     }
 }
 
-async fn start_dhcp_server(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
+pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
     println!("Starting DHCP listener on port 67...");
 
     let socket = UdpSocket::bind("0.0.0.0:67").await?;
@@ -285,16 +285,4 @@ async fn start_dhcp_server(config: MiniDHCPConfiguration) -> anyhow::Result<()> 
             continue;
         }
     }
-}
-
-pub async fn start() -> anyhow::Result<()> {
-    let config = MiniDHCPConfiguration::new().await?;
-
-    let handle = tokio::spawn(start_dhcp_server(config.clone()));
-
-    tokio::spawn(info::start_info_server(config));
-
-    handle.await??;
-
-    Ok(())
 }

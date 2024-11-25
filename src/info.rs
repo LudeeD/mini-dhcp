@@ -1,24 +1,9 @@
 use crate::{db, Client, MiniDHCPConfiguration};
-use axum::{extract::State, routing::get, Json, Router};
+use axum::Json;
 use futures::future::join_all;
 
-pub async fn start_info_server(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
-    println!("Starting DHCP info server listener on port 6767...");
-    let app = Router::new()
-        .route("/leases", get(get_leases_handler))
-        .with_state(config);
-
-    // run our app with hyper, listening globally on port 3000
-    let listener = tokio::net::TcpListener::bind("localhost:6767")
-        .await
-        .unwrap();
-    axum::serve(listener, app).await.unwrap();
-
-    Ok(())
-}
-
-async fn get_leases_handler(State(state): State<MiniDHCPConfiguration>) -> Json<Vec<Client>> {
-    let leases = match db::get_all_leases(&state.leases).await {
+pub async fn get_status(conf: &MiniDHCPConfiguration) -> Json<Vec<Client>> {
+    let leases = match db::get_all_leases(&conf.leases).await {
         Ok(leases) => leases,
         Err(e) => {
             eprintln!("Error: {:?}", e);
