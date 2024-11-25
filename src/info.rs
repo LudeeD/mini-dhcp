@@ -1,8 +1,7 @@
 use crate::{db, Client, MiniDHCPConfiguration};
-use axum::Json;
 use futures::future::join_all;
 
-pub async fn get_status(conf: &MiniDHCPConfiguration) -> Json<Vec<Client>> {
+pub async fn get_status(conf: &MiniDHCPConfiguration) -> Vec<Client> {
     let leases = match db::get_all_leases(&conf.leases).await {
         Ok(leases) => leases,
         Err(e) => {
@@ -36,5 +35,5 @@ pub async fn get_status(conf: &MiniDHCPConfiguration) -> Json<Vec<Client>> {
         })
         .collect();
 
-    Json(clients)
+    clients
 }
