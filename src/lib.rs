@@ -24,10 +24,10 @@ struct Lease {
 
 #[derive(Debug, Serialize)]
 pub struct Client {
-    ip: Ipv4Addr,
-    client_id: String,
-    hostname: String,
-    online: bool,
+    pub ip: Ipv4Addr,
+    pub client_id: String,
+    pub hostname: String,
+    pub online: bool,
 }
 
 async fn insert_lease(pool: &SqlitePool, ip: Ipv4Addr, client_id: &Vec<u8>) -> anyhow::Result<()> {
