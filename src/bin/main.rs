@@ -4,7 +4,7 @@ use mini_dhcp::{self, info, MiniDHCPConfiguration};
 async fn main() {
     // Start listening on UDP port 67
 
-    let conf = MiniDHCPConfiguration::new()
+    let conf = MiniDHCPConfiguration::new(String::from("enP8p1s0"))
         .await
         .expect("Expected to be able to build configuration");
 

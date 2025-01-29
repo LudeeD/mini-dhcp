@@ -202,18 +202,19 @@ async fn build_dhcp_ack_packet(leases: &SqlitePool, request_message: Message) ->
 
 #[derive(Clone)]
 pub struct MiniDHCPConfiguration {
+    interface: String,
     leases: SqlitePool,
 }
 
 impl MiniDHCPConfiguration {
-    pub async fn new() -> anyhow::Result<Self> {
+    pub async fn new(interface: String) -> anyhow::Result<Self> {
         let conn = SqliteConnectOptions::from_str("sqlite://dhcp.db")?.create_if_missing(true);
 
         let leases = SqlitePool::connect_with(conn).await?;
 
         sqlx::migrate!("./db/migrations").run(&leases).await?;
 
-        Ok(Self { leases })
+        Ok(Self { leases, interface })
     }
 }
 
@@ -222,7 +223,7 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
 
     let socket = UdpSocket::bind("0.0.0.0:67").await?;
     socket.set_broadcast(true)?;
-    socket.bind_device(Some("enP8p1s0".as_bytes()))?;
+    socket.bind_device(Some(config.interface.as_bytes()))?;
 
     let mut buf = vec![0u8; 1024];
 
@@ -231,15 +232,23 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
         let (_len, addr) = socket.recv_from(&mut buf).await?;
 
         let decoded_message = Message::decode(&mut Decoder::new(&buf))?;
+        let cloned_decoded_message = decoded_message.clone();
+        let transaction_id = cloned_decoded_message.xid();
+        let client_address = cloned_decoded_message.chaddr();
 
         let options = decoded_message.opts();
 
         if options.has_msg_type(MessageType::Discover) {
+            println!("{} DISCOVER: {:?}", transaction_id, client_address);
             let offer = build_dhcp_offer_packet(&config.leases, decoded_message);
 
             match offer.await {
                 Ok(offer) => {
-                    println!("Sending {:#?}", offer);
+                    let offered_ip = offer.yiaddr();
+                    println!(
+                        "{} OFFER: {:?} {:?}",
+                        transaction_id, client_address, offered_ip
+                    );
 
                     let mut buf = Vec::new();
                     let mut e = Encoder::new(&mut buf);
@@ -248,7 +257,7 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
                     socket.send_to(&buf, "255.255.255.255:68").await?;
                 }
                 Err(e) => {
-                    println!("Error: {:?}", e);
+                    println!("OFFER Error: {:?}", e);
                 }
             }
 
@@ -257,6 +266,7 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
 
         if options.has_msg_type(MessageType::Request) {
             let server_identifier = options.get(OptionCode::ServerIdentifier);
+            println!("{} REQUEST: {:?}", transaction_id, client_address);
 
             match server_identifier {
                 Some(DhcpOption::ServerIdentifier(ip)) => {
@@ -273,11 +283,16 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
             let ack = build_dhcp_ack_packet(&config.leases, decoded_message);
 
             if let Some(ack) = ack.await {
-                println!("Sending {:#?}", ack);
-
                 let mut buf = Vec::new();
                 let mut e = Encoder::new(&mut buf);
                 ack.encode(&mut e)?;
+
+                let offered_ip = ack.yiaddr();
+
+                println!(
+                    "{} ACK: {:?} {:?}",
+                    transaction_id, client_address, offered_ip
+                );
 
                 socket.send_to(&buf, "255.255.255.255:68").await?;
             }
