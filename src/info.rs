@@ -1,11 +1,12 @@
 use crate::{db, Client, MiniDHCPConfiguration};
 use futures::future::join_all;
+use tracing::error;
 
 pub async fn get_status(conf: &MiniDHCPConfiguration) -> Vec<Client> {
     let leases = match db::get_all_leases(&conf.leases).await {
         Ok(leases) => leases,
         Err(e) => {
-            eprintln!("Error: {:?}", e);
+            error!("Error: {:?}", e);
             Vec::new()
         }
     };
@@ -25,7 +26,7 @@ pub async fn get_status(conf: &MiniDHCPConfiguration) -> Vec<Client> {
 
     let results = join_all(futures).await;
 
-    let clients = results
+    results
         .into_iter()
         .map(|(ip, client_id, is_online)| Client {
             ip,
@@ -33,7 +34,5 @@ pub async fn get_status(conf: &MiniDHCPConfiguration) -> Vec<Client> {
             hostname: String::from("todo"),
             online: is_online,
         })
-        .collect();
-
-    clients
+        .collect()
 }

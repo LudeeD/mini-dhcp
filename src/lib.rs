@@ -9,9 +9,11 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 use tokio::net::UdpSocket;
+use tracing::{error, info, warn};
 mod db;
 pub mod info;
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct Lease {
     ip: i64,
@@ -36,7 +38,7 @@ async fn insert_lease(pool: &SqlitePool, ip: Ipv4Addr, client_id: &Vec<u8>) -> a
     let expire_at = Zoned::now()
         .round(Unit::Second)?
         .checked_add(1.hour())
-        .with_context(|| format!("Fuck"))?
+        .with_context(|| "Fuck".to_string())?
         .timestamp()
         .as_second();
 
@@ -54,7 +56,7 @@ async fn insert_lease(pool: &SqlitePool, ip: Ipv4Addr, client_id: &Vec<u8>) -> a
 
 async fn build_dhcp_offer_packet(
     leases: &SqlitePool,
-    discover_message: Message,
+    discover_message: &Message,
 ) -> anyhow::Result<Message> {
     let client_id = discover_message.chaddr().to_vec();
 
@@ -68,17 +70,29 @@ async fn build_dhcp_offer_packet(
     // pool of available addresses and not already allocated, ELSE
     let mut suggested_address = match db::get_ip_from_client_id(leases, &client_id).await {
         Ok(address) => {
-            println!("Client already has IP assigned: {:?}", address);
+            info!(
+                "[OFFER] Client {:?} already has IP assigned: {:?}",
+                client_id, address
+            );
             Some(address)
         }
-        _ => None,
+        _ => {
+            warn!(
+                "[OFFER] Client {:?} has no IP assigned in the database",
+                client_id
+            );
+            None
+        }
     };
 
     // The address requested in the 'Requested IP Address' option, if that
     // address is valid and not already allocated, ELSE
     if suggested_address.is_none() {
         let requested_ip_address = discover_message.opts().get(OptionCode::RequestedIpAddress);
-        println!("Client requested IP address: {:?}", requested_ip_address);
+        info!(
+            "[OFFER] Client requested IP address: {:?}",
+            requested_ip_address
+        );
         match requested_ip_address {
             Some(DhcpOption::RequestedIpAddress(ip)) => {
                 if !db::is_ip_assigned(leases, *ip).await? {
@@ -86,7 +100,7 @@ async fn build_dhcp_offer_packet(
                 }
             }
             _ => {
-                println!("No requested IP address")
+                warn!("[OFFER] No requested IP address")
             }
         };
     }
@@ -116,7 +130,7 @@ async fn build_dhcp_offer_packet(
         None => return Err(anyhow::anyhow!("Could not assign IP address")),
     };
 
-    println!("Creating offer");
+    info!("[OFFER] creating offer with IP {}", suggested_address);
 
     let mut offer = Message::default();
 
@@ -146,50 +160,83 @@ async fn build_dhcp_offer_packet(
         .opts_mut()
         .insert(DhcpOption::Router(vec![Ipv4Addr::new(192, 168, 1, 69)]));
 
-    println!("Offer: {:?}", offer);
     Ok(offer)
 }
 
-async fn build_dhcp_ack_packet(leases: &SqlitePool, request_message: Message) -> Option<Message> {
-    // checks
-    let server_identifier = request_message.opts().get(OptionCode::ServerIdentifier);
-    println!("Server identifier: {:?}", server_identifier);
+async fn build_dhcp_ack_packet(
+    leases: &SqlitePool,
+    request_message: &Message,
+) -> anyhow::Result<Message> {
+    let server_identifier_option = request_message.opts().get(OptionCode::ServerIdentifier);
 
-    let ciadr = request_message.ciaddr();
-    println!("Client address: {:?}", ciadr);
+    let requested_ip_option = request_message.opts().get(OptionCode::RequestedIpAddress);
 
-    let requested_ip_address = request_message.opts().get(OptionCode::RequestedIpAddress);
-    println!("Requested IP address: {:?}", requested_ip_address);
-    let requested_ip_address = match requested_ip_address {
-        Some(DhcpOption::RequestedIpAddress(ip)) => ip,
-        _ => return None,
-    };
-
-    let mut ack = Message::default();
-
+    // `ciaddr` is the client’s current IP address (used in RENEWING/REBINDING)
+    let ciaddr = request_message.ciaddr();
     let chaddr = request_message.chaddr().to_owned();
 
-    let lease = db::get_lease_by_ip(leases, *requested_ip_address)
-        .await
-        .ok()?;
+    let (is_selecting, is_init_reboot, is_renewing_rebinding) = {
+        let have_server_id = server_identifier_option.is_some();
+        let have_requested_ip = requested_ip_option.is_some();
+        let ciaddr_is_zero = ciaddr == Ipv4Addr::new(0, 0, 0, 0);
 
-    if lease.client_id != chaddr {
-        return None;
+        // SELECTING state
+        let selecting = have_server_id && have_requested_ip && ciaddr_is_zero;
+
+        // INIT-REBOOT
+        let init_reboot = !have_server_id && have_requested_ip && ciaddr_is_zero;
+
+        // RENEWING/REBINDING: ciaddr != 0, no 'requested IP address'
+        let renewing_rebinding = ciaddr != Ipv4Addr::new(0, 0, 0, 0) && !have_requested_ip;
+
+        (selecting, init_reboot, renewing_rebinding)
+    };
+
+    let ip_to_validate = if is_selecting || is_init_reboot {
+        match requested_ip_option {
+            Some(DhcpOption::RequestedIpAddress(ip)) => {
+                info!("[ACK] Client requested IP address: {:?}", ip);
+                ip
+            }
+            _ => {
+                anyhow::bail!("[ACK] Client didnt requested IP address")
+            }
+        }
+    } else if is_renewing_rebinding {
+        info!("[ACK] using ciaddr {:?}", ciaddr);
+        &ciaddr
+    } else {
+        anyhow::bail!("[ACK] DHCPREQUEST does not match any known valid state.");
+    };
+
+    // 4) Validate that the IP is on the correct subnet (RFC says to NAK if it’s on the wrong net).
+    //    Also check if you have a valid lease for this client in your DB, etc.
+    let lease = match db::get_lease_by_ip(leases, ip_to_validate).await {
+        Ok(lease) => lease,
+        Err(e) => {
+            anyhow::bail!("[ACK] NO RECORD FOUND ON DB {:?}", e);
+        }
+    };
+
+    if !lease.leased {
+        anyhow::bail!("[ACK] IP address is not leased");
     }
 
+    let mut ack = Message::default();
     ack.set_opcode(Opcode::BootReply);
-    ack.set_xid(request_message.xid()); // Transaction ID
-    ack.set_yiaddr(requested_ip_address.clone());
-    ack.set_siaddr(Ipv4Addr::new(192, 168, 1, 69));
+    ack.set_xid(request_message.xid());
     ack.set_flags(request_message.flags());
     ack.set_giaddr(request_message.giaddr());
-    ack.set_chaddr(request_message.chaddr());
+    ack.set_chaddr(&chaddr);
+
+    ack.set_yiaddr(*ip_to_validate);
 
     ack.opts_mut()
         .insert(DhcpOption::MessageType(MessageType::Ack));
-    ack.opts_mut().insert(DhcpOption::AddressLeaseTime(3600));
     ack.opts_mut()
         .insert(DhcpOption::ServerIdentifier(Ipv4Addr::new(192, 168, 1, 69)));
+
+    ack.opts_mut().insert(DhcpOption::AddressLeaseTime(3600));
     ack.opts_mut()
         .insert(DhcpOption::SubnetMask(Ipv4Addr::new(255, 255, 255, 0)));
     ack.opts_mut()
@@ -197,7 +244,7 @@ async fn build_dhcp_ack_packet(leases: &SqlitePool, request_message: Message) ->
     ack.opts_mut()
         .insert(DhcpOption::Router(vec![Ipv4Addr::new(192, 168, 1, 69)]));
 
-    Some(ack)
+    Ok(ack)
 }
 
 #[derive(Clone)]
@@ -218,85 +265,135 @@ impl MiniDHCPConfiguration {
     }
 }
 
-pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
-    println!("Starting DHCP listener on port 67...");
+async fn handle_discover(
+    config: &MiniDHCPConfiguration,
+    decoded_message: &Message,
+) -> anyhow::Result<Vec<u8>> {
+    let transaction_id = decoded_message.xid();
+    let client_address = decoded_message.chaddr();
+    info!("[{:X}] DISCOVER {:?}", transaction_id, client_address);
+    let offer = build_dhcp_offer_packet(&config.leases, decoded_message);
 
-    let socket = UdpSocket::bind("0.0.0.0:67").await?;
+    match offer.await {
+        Ok(offer) => {
+            let offered_ip = offer.yiaddr();
+            info!(
+                "[{:X}] [OFFER]: client {:?} ip {:?}",
+                transaction_id, client_address, offered_ip
+            );
+
+            let mut buf = Vec::new();
+            let mut e = Encoder::new(&mut buf);
+            offer.encode(&mut e)?;
+            Ok(buf)
+        }
+        Err(e) => {
+            anyhow::bail!("OFFER Error: {:?}", e)
+        }
+    }
+}
+
+async fn handle_request(
+    config: &MiniDHCPConfiguration,
+    decoded_message: &Message,
+) -> anyhow::Result<Vec<u8>> {
+    let options = decoded_message.opts();
+    let transaction_id = decoded_message.xid();
+    let client_address = decoded_message.chaddr();
+    let server_identifier = options.get(OptionCode::ServerIdentifier);
+    info!(
+        "[{:X}] REQUEST from {:?} to {:?}",
+        transaction_id, client_address, server_identifier
+    );
+
+    let ack = build_dhcp_ack_packet(&config.leases, decoded_message);
+
+    match ack.await {
+        Ok(ack) => {
+            let mut buf = Vec::new();
+            let mut e = Encoder::new(&mut buf);
+            ack.encode(&mut e)?;
+            let offered_ip = ack.yiaddr();
+            info!(
+                "[{:X}] [ACK]: {:?} {:?}",
+                transaction_id, client_address, offered_ip
+            );
+            Ok(buf)
+        }
+        Err(e) => {
+            anyhow::bail!("ACK Error: {:?}", e)
+        }
+    }
+}
+
+pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
+    let address = "0.0.0.0:67";
+    info!("Starting DHCP listener [{}] {}", config.interface, address);
+    let socket = UdpSocket::bind(address).await?;
     socket.set_broadcast(true)?;
     socket.bind_device(Some(config.interface.as_bytes()))?;
 
-    let mut buf = vec![0u8; 1024];
+    let mut read_buffer = vec![0u8; 1024];
 
     loop {
         // Receive a packet
-        let (_len, addr) = socket.recv_from(&mut buf).await?;
+        let (_len, addr) = socket.recv_from(&mut read_buffer).await?;
+        info!("== Received packet from {:?} ==", addr);
 
-        let decoded_message = Message::decode(&mut Decoder::new(&buf))?;
-        let cloned_decoded_message = decoded_message.clone();
-        let transaction_id = cloned_decoded_message.xid();
-        let client_address = cloned_decoded_message.chaddr();
+        let decoded_message = Message::decode(&mut Decoder::new(&read_buffer))?;
+        // https://datatracker.ietf.org/doc/html/rfc2131#page-13
+        // The 'op' field of each DHCP message sent from a client to a server contains BOOTREQUEST.
+        if decoded_message.opcode() != Opcode::BootRequest {
+            error!("[ERROR] opcode is not BootRequest, ignoring message");
+            continue;
+        }
 
         let options = decoded_message.opts();
 
         if options.has_msg_type(MessageType::Discover) {
-            println!("{} DISCOVER: {:?}", transaction_id, client_address);
-            let offer = build_dhcp_offer_packet(&config.leases, decoded_message);
-
-            match offer.await {
-                Ok(offer) => {
-                    let offered_ip = offer.yiaddr();
-                    println!(
-                        "{} OFFER: {:?} {:?}",
-                        transaction_id, client_address, offered_ip
-                    );
-
-                    let mut buf = Vec::new();
-                    let mut e = Encoder::new(&mut buf);
-                    offer.encode(&mut e)?;
-
-                    socket.send_to(&buf, "255.255.255.255:68").await?;
-                }
-                Err(e) => {
-                    println!("OFFER Error: {:?}", e);
-                }
+            let transaction_id = decoded_message.xid();
+            let response = handle_discover(&config, &decoded_message).await;
+            if let Ok(response) = response {
+                info!("[{:X}] [OFFER] Sending...", transaction_id);
+                socket
+                    .send_to(&response, "255.255.255.255:68")
+                    .await
+                    .expect("[OFFER] Failed to send in socket");
+            } else {
+                error!("[ERROR] handling DISCOVER {:?}", response);
             }
-
             continue;
         }
 
         if options.has_msg_type(MessageType::Request) {
-            let server_identifier = options.get(OptionCode::ServerIdentifier);
-            println!("{} REQUEST: {:?}", transaction_id, client_address);
-
-            match server_identifier {
-                Some(DhcpOption::ServerIdentifier(ip)) => {
-                    println!(
-                        "Request with server identifier {:?} in response to DHCPOFFER ",
-                        ip
-                    );
-                }
-                _ => {
-                    println!("No server identifier verify or extend existing lease");
-                }
+            let transaction_id = decoded_message.xid();
+            let response = handle_request(&config, &decoded_message).await;
+            if let Ok(response) = response {
+                info!("[{:X}] [ACK] Sending...", transaction_id);
+                socket
+                    .send_to(&response, "255.255.255.255:68")
+                    .await
+                    .expect("[ACK] Failed to send in socket");
+            } else {
+                error!("[ERROR] handling REQUEST {:?}", response);
             }
+            continue;
+        }
 
-            let ack = build_dhcp_ack_packet(&config.leases, decoded_message);
+        if options.has_msg_type(MessageType::Decline) {
+            let transaction_id = decoded_message.xid();
+            info!("[{:X}] [DECLINE]", transaction_id);
+            continue;
+        }
 
-            if let Some(ack) = ack.await {
-                let mut buf = Vec::new();
-                let mut e = Encoder::new(&mut buf);
-                ack.encode(&mut e)?;
-
-                let offered_ip = ack.yiaddr();
-
-                println!(
-                    "{} ACK: {:?} {:?}",
-                    transaction_id, client_address, offered_ip
-                );
-
-                socket.send_to(&buf, "255.255.255.255:68").await?;
-            }
-
+        if options.has_msg_type(MessageType::Release) {
+            let transaction_id = decoded_message.xid();
+            info!("[{:X}] [RELEASE]", transaction_id);
+            continue;
+        }
+        if options.has_msg_type(MessageType::Inform) {
+            let transaction_id = decoded_message.xid();
+            info!("[{:X}] [INFORM]", transaction_id);
             continue;
         }
     }
