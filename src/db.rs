@@ -14,11 +14,15 @@ pub async fn is_ip_assigned(pool: &SqlitePool, ip: Ipv4Addr) -> Result<bool, sql
     }
 }
 
-pub async fn get_lease_by_ip(pool: &SqlitePool, ip: Ipv4Addr) -> Result<Lease, sqlx::Error> {
-    let arg = u32::from(ip);
-    sqlx::query_as!(Lease, "SELECT * FROM leases WHERE ip = ? AND leased", arg)
-        .fetch_one(pool)
-        .await
+pub async fn get_lease_by_ip(pool: &SqlitePool, ip: &Ipv4Addr) -> Result<Lease, sqlx::Error> {
+    let arg = u32::from(*ip);
+    sqlx::query_as!(
+        Lease,
+        "SELECT * FROM leases WHERE ip = ? AND leased ORDER BY expires_at DESC LIMIT 1",
+        arg
+    )
+    .fetch_one(pool)
+    .await
 }
 
 pub async fn get_all_leases(pool: &SqlitePool) -> Result<Vec<Lease>, sqlx::Error> {
