@@ -1,5 +1,4 @@
 use crate::{db, Client, MiniDHCPConfiguration};
-use futures::future::join_all;
 use tracing::error;
 
 pub async fn get_status(conf: &MiniDHCPConfiguration) -> Vec<Client> {
@@ -11,28 +10,11 @@ pub async fn get_status(conf: &MiniDHCPConfiguration) -> Vec<Client> {
         }
     };
 
-    let futures = leases.iter().map(|lease| {
-        let ip = std::net::Ipv4Addr::from(lease.ip as u32);
-        async move {
-            let is_online = tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                tokio::net::TcpStream::connect(format!("{}:80", ip)),
-            )
-            .await
-            .is_ok();
-            (ip, lease.client_id.clone(), is_online)
-        }
-    });
-
-    let results = join_all(futures).await;
-
-    results
+    leases
         .into_iter()
-        .map(|(ip, client_id, is_online)| Client {
-            ip,
-            client_id: hex::encode(client_id),
-            hostname: String::from("todo"),
-            online: is_online,
+        .map(|lease| Client {
+            ip: std::net::Ipv4Addr::from(lease.ip as u32),
+            client_id: hex::encode(lease.client_id),
         })
         .collect()
 }

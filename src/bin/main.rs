@@ -1,4 +1,4 @@
-use mini_dhcp::{self, info, MiniDHCPConfiguration};
+use mini_dhcp::{self, MiniDHCPConfiguration};
 
 #[tokio::main]
 async fn main() {
@@ -15,9 +15,5 @@ async fn main() {
 
     loop {
         every_second.tick().await;
-
-        //let demo = info::get_status(&conf).await;
-
-        //println!("{:?}", demo);
     }
 }
