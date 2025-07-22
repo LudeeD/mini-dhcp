@@ -30,6 +30,16 @@ pub struct Client {
     pub client_id: String,
 }
 
+fn check_ip_in_range(addr: Ipv4Addr) -> bool {
+    let [a, b, c, d] = addr.octets();
+    a == 192 && b == 168 && c == 1 && (100..200).contains(&d)
+}
+
+fn get_ip_in_range() -> Ipv4Addr {
+    let octet = rand::thread_rng().gen_range(100..200);
+    Ipv4Addr::new(192, 168, 1, octet)
+}
+
 async fn insert_lease(pool: &SqlitePool, ip: Ipv4Addr, client_id: &Vec<u8>) -> anyhow::Result<()> {
     let ip = u32::from(ip);
 
@@ -93,7 +103,7 @@ async fn build_dhcp_offer_packet(
         );
         match requested_ip_address {
             Some(DhcpOption::RequestedIpAddress(ip)) => {
-                if !db::is_ip_assigned(leases, *ip).await? {
+                if !db::is_ip_assigned(leases, *ip).await? && check_ip_in_range(*ip) {
                     suggested_address = Some(*ip);
                 }
             }
@@ -106,7 +116,7 @@ async fn build_dhcp_offer_packet(
     if suggested_address.is_none() {
         let mut max_tries: u8 = 10;
         loop {
-            let random_address = Ipv4Addr::new(192, 168, 1, rand::thread_rng().gen_range(100..200));
+            let random_address = get_ip_in_range();
 
             if !db::is_ip_assigned(leases, random_address).await? {
                 suggested_address = Some(random_address);
