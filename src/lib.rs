@@ -171,10 +171,40 @@ async fn build_dhcp_offer_packet(
     Ok(offer)
 }
 
+/// Response type for DHCP REQUEST handling
+#[derive(Debug)]
+enum DhcpResponse {
+    Ack(Message),
+    Nak(Message),
+}
+
+/// Build a DHCP NAK packet according to RFC 2131 Table 3
+fn build_dhcp_nack_packet(request_message: &Message, reason: &str) -> Message {
+    info!("[NAK] Sending NACK: {}", reason);
+
+    let mut nak = Message::default();
+    nak.set_opcode(Opcode::BootReply);
+    nak.set_xid(request_message.xid());
+    nak.set_flags(request_message.flags());
+    nak.set_chaddr(request_message.chaddr());
+
+    // RFC 2131 Table 3: yiaddr and siaddr must be 0 for NACK
+    nak.set_yiaddr(Ipv4Addr::new(0, 0, 0, 0));
+    nak.set_siaddr(Ipv4Addr::new(0, 0, 0, 0));
+
+    // Only include MessageType and ServerIdentifier options
+    nak.opts_mut()
+        .insert(DhcpOption::MessageType(MessageType::Nak));
+    nak.opts_mut()
+        .insert(DhcpOption::ServerIdentifier(Ipv4Addr::new(192, 168, 1, 69)));
+
+    nak
+}
+
 async fn build_dhcp_ack_packet(
     leases: &SqlitePool,
     request_message: &Message,
-) -> anyhow::Result<Message> {
+) -> anyhow::Result<DhcpResponse> {
     let server_identifier_option = request_message.opts().get(OptionCode::ServerIdentifier);
 
     let requested_ip_option = request_message.opts().get(OptionCode::RequestedIpAddress);
@@ -207,27 +237,40 @@ async fn build_dhcp_ack_packet(
                 ip
             }
             _ => {
-                anyhow::bail!("[ACK] Client didnt requested IP address")
+                return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
+                    request_message,
+                    "Client didn't provide requested IP address",
+                )));
             }
         }
     } else if is_renewing_rebinding {
         info!("[ACK] using ciaddr {:?}", ciaddr);
         &ciaddr
     } else {
-        anyhow::bail!("[ACK] DHCPREQUEST does not match any known valid state.");
+        return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
+            request_message,
+            "DHCPREQUEST does not match any known valid state",
+        )));
     };
 
-    // 4) Validate that the IP is on the correct subnet (RFC says to NAK if it’s on the wrong net).
+    // 4) Validate that the IP is on the correct subnet (RFC says to NAK if it's on the wrong net).
     //    Also check if you have a valid lease for this client in your DB, etc.
     let lease = match db::get_lease_by_ip(leases, ip_to_validate).await {
         Ok(lease) => lease,
         Err(e) => {
-            anyhow::bail!("[ACK] NO RECORD FOUND ON DB {:?}", e);
+            warn!("[ACK] NO RECORD FOUND ON DB {:?}", e);
+            return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
+                request_message,
+                "No lease record found in database",
+            )));
         }
     };
 
     if !lease.leased {
-        anyhow::bail!("[ACK] IP address is not leased");
+        return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
+            request_message,
+            "IP address is not currently leased",
+        )));
     }
 
     let mut ack = Message::default();
@@ -252,7 +295,7 @@ async fn build_dhcp_ack_packet(
     ack.opts_mut()
         .insert(DhcpOption::Router(vec![Ipv4Addr::new(192, 168, 1, 69)]));
 
-    Ok(ack)
+    Ok(DhcpResponse::Ack(ack))
 }
 
 #[derive(Clone)]
@@ -304,7 +347,7 @@ async fn handle_discover(
 async fn handle_request(
     config: &MiniDHCPConfiguration,
     decoded_message: &Message,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<DhcpResponse> {
     let options = decoded_message.opts();
     let transaction_id = decoded_message.xid();
     let client_address = decoded_message.chaddr();
@@ -314,24 +357,22 @@ async fn handle_request(
         transaction_id, client_address, server_identifier
     );
 
-    let ack = build_dhcp_ack_packet(&config.leases, decoded_message);
+    let response = build_dhcp_ack_packet(&config.leases, decoded_message).await?;
 
-    match ack.await {
-        Ok(ack) => {
-            let mut buf = Vec::new();
-            let mut e = Encoder::new(&mut buf);
-            ack.encode(&mut e)?;
+    match &response {
+        DhcpResponse::Ack(ack) => {
             let offered_ip = ack.yiaddr();
             info!(
                 "[{:X}] [ACK]: {:?} {:?}",
                 transaction_id, client_address, offered_ip
             );
-            Ok(buf)
         }
-        Err(e) => {
-            anyhow::bail!("ACK Error: {:?}", e)
+        DhcpResponse::Nak(_) => {
+            info!("[{:X}] [NAK]: {:?}", transaction_id, client_address);
         }
     }
+
+    Ok(response)
 }
 
 pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
@@ -376,14 +417,30 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
         if options.has_msg_type(MessageType::Request) {
             let transaction_id = decoded_message.xid();
             let response = handle_request(&config, &decoded_message).await;
-            if let Ok(response) = response {
-                info!("[{:X}] [ACK] Sending...", transaction_id);
-                socket
-                    .send_to(&response, "255.255.255.255:68")
-                    .await
-                    .expect("[ACK] Failed to send in socket");
-            } else {
-                error!("[ERROR] handling REQUEST {:?}", response);
+            match response {
+                Ok(DhcpResponse::Ack(ack)) => {
+                    info!("[{:X}] [ACK] Sending...", transaction_id);
+                    let mut buf = Vec::new();
+                    let mut e = Encoder::new(&mut buf);
+                    ack.encode(&mut e).expect("[ACK] Failed to encode");
+                    socket
+                        .send_to(&buf, "255.255.255.255:68")
+                        .await
+                        .expect("[ACK] Failed to send in socket");
+                }
+                Ok(DhcpResponse::Nak(nak)) => {
+                    info!("[{:X}] [NAK] Sending...", transaction_id);
+                    let mut buf = Vec::new();
+                    let mut e = Encoder::new(&mut buf);
+                    nak.encode(&mut e).expect("[NAK] Failed to encode");
+                    socket
+                        .send_to(&buf, "255.255.255.255:68")
+                        .await
+                        .expect("[NAK] Failed to send in socket");
+                }
+                Err(e) => {
+                    error!("[ERROR] handling REQUEST {:?}", e);
+                }
             }
             continue;
         }
