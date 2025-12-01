@@ -5,7 +5,7 @@ async fn main() {
     // Start listening on UDP port 67
     tracing_subscriber::fmt::init();
 
-    let conf = MiniDHCPConfiguration::new(String::from("enxc84d4433b895"))
+    let conf = MiniDHCPConfiguration::new(String::from("enp0s31f6"))
         .await
         .expect("Expected to be able to build configuration");
 

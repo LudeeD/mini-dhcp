@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE leases\nSET probation = 1, leased = 0\nWHERE ip = ?;\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "9bd43b4ff1a7e04b5c1ba5bbaaf316d306a7301e76ec4bb89e22ee38ca25215b"
+}
