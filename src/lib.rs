@@ -347,7 +347,7 @@ async fn handle_discover(
 async fn handle_request(
     config: &MiniDHCPConfiguration,
     decoded_message: &Message,
-) -> anyhow::Result<DhcpResponse> {
+) -> anyhow::Result<Vec<u8>> {
     let options = decoded_message.opts();
     let transaction_id = decoded_message.xid();
     let client_address = decoded_message.chaddr();
@@ -359,20 +359,28 @@ async fn handle_request(
 
     let response = build_dhcp_ack_packet(&config.leases, decoded_message).await?;
 
-    match &response {
+    match response {
         DhcpResponse::Ack(ack) => {
             let offered_ip = ack.yiaddr();
             info!(
                 "[{:X}] [ACK]: {:?} {:?}",
                 transaction_id, client_address, offered_ip
             );
+
+            let mut buf = Vec::new();
+            let mut e = Encoder::new(&mut buf);
+            ack.encode(&mut e)?;
+            Ok(buf)
         }
-        DhcpResponse::Nak(_) => {
+        DhcpResponse::Nak(nak) => {
             info!("[{:X}] [NAK]: {:?}", transaction_id, client_address);
+
+            let mut buf = Vec::new();
+            let mut e = Encoder::new(&mut buf);
+            nak.encode(&mut e)?;
+            Ok(buf)
         }
     }
-
-    Ok(response)
 }
 
 pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
@@ -417,30 +425,14 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
         if options.has_msg_type(MessageType::Request) {
             let transaction_id = decoded_message.xid();
             let response = handle_request(&config, &decoded_message).await;
-            match response {
-                Ok(DhcpResponse::Ack(ack)) => {
-                    info!("[{:X}] [ACK] Sending...", transaction_id);
-                    let mut buf = Vec::new();
-                    let mut e = Encoder::new(&mut buf);
-                    ack.encode(&mut e).expect("[ACK] Failed to encode");
-                    socket
-                        .send_to(&buf, "255.255.255.255:68")
-                        .await
-                        .expect("[ACK] Failed to send in socket");
-                }
-                Ok(DhcpResponse::Nak(nak)) => {
-                    info!("[{:X}] [NAK] Sending...", transaction_id);
-                    let mut buf = Vec::new();
-                    let mut e = Encoder::new(&mut buf);
-                    nak.encode(&mut e).expect("[NAK] Failed to encode");
-                    socket
-                        .send_to(&buf, "255.255.255.255:68")
-                        .await
-                        .expect("[NAK] Failed to send in socket");
-                }
-                Err(e) => {
-                    error!("[ERROR] handling REQUEST {:?}", e);
-                }
+            if let Ok(response) = response {
+                info!("[{:X}] [ACK/NAK] Sending...", transaction_id);
+                socket
+                    .send_to(&response, "255.255.255.255:68")
+                    .await
+                    .expect("[ACK/NAK] Failed to send in socket");
+            } else {
+                error!("[ERROR] handling REQUEST {:?}", response);
             }
             continue;
         }
