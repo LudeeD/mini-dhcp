@@ -46,7 +46,7 @@ async fn insert_lease(pool: &SqlitePool, ip: Ipv4Addr, client_id: &Vec<u8>) -> a
     let expire_at = Zoned::now()
         .round(Unit::Second)?
         .checked_add(1.hour())
-        .with_context(|| "Fuck".to_string())?
+        .with_context(|| "Failed to calculate lease expiry time".to_string())?
         .timestamp()
         .as_second();
 
@@ -273,6 +273,25 @@ async fn build_dhcp_ack_packet(
         )));
     }
 
+    // Check if lease has expired
+    let current_time = Zoned::now().round(Unit::Second)?.timestamp().as_second();
+    if lease.expires_at < current_time {
+        warn!("[ACK] Lease has expired: expires_at={}, current={}", lease.expires_at, current_time);
+        return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
+            request_message,
+            "Lease has expired",
+        )));
+    }
+
+    // Validate that the client_id matches the lease
+    if lease.client_id != chaddr {
+        warn!("[ACK] Client ID mismatch: lease has {:?}, request has {:?}", lease.client_id, chaddr);
+        return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
+            request_message,
+            "IP address is leased to a different client",
+        )));
+    }
+
     let mut ack = Message::default();
     ack.set_opcode(Opcode::BootReply);
     ack.set_xid(request_message.xid());
@@ -294,6 +313,16 @@ async fn build_dhcp_ack_packet(
         .insert(DhcpOption::BroadcastAddr(Ipv4Addr::new(255, 255, 255, 255)));
     ack.opts_mut()
         .insert(DhcpOption::Router(vec![Ipv4Addr::new(192, 168, 1, 69)]));
+
+    // Update lease expiry time in database
+    let new_expiry = Zoned::now()
+        .round(Unit::Second)?
+        .checked_add(1.hour())
+        .with_context(|| "Failed to calculate new lease expiry time".to_string())?
+        .timestamp()
+        .as_second();
+
+    db::update_lease_expiry(leases, *ip_to_validate, new_expiry).await?;
 
     Ok(DhcpResponse::Ack(ack))
 }
@@ -390,10 +419,9 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
     socket.set_broadcast(true)?;
     socket.bind_device(Some(config.interface.as_bytes()))?;
 
-    let mut read_buffer = vec![0u8; 1024];
-
     loop {
         // Receive a packet
+        let mut read_buffer = vec![0u8; 1024];
         let (_len, addr) = socket.recv_from(&mut read_buffer).await?;
         info!("== Received packet from {:?} ==", addr);
 
@@ -412,10 +440,12 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
             let response = handle_discover(&config, &decoded_message).await;
             if let Ok(response) = response {
                 info!("[{:X}] [OFFER] Sending...", transaction_id);
-                socket
+                if let Err(e) = socket
                     .send_to(&response, "255.255.255.255:68")
                     .await
-                    .expect("[OFFER] Failed to send in socket");
+                {
+                    error!("[{:X}] [OFFER] Failed to send in socket: {:?}", transaction_id, e);
+                }
             } else {
                 error!("[ERROR] handling DISCOVER {:?}", response);
             }
@@ -427,10 +457,12 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
             let response = handle_request(&config, &decoded_message).await;
             if let Ok(response) = response {
                 info!("[{:X}] [ACK/NAK] Sending...", transaction_id);
-                socket
+                if let Err(e) = socket
                     .send_to(&response, "255.255.255.255:68")
                     .await
-                    .expect("[ACK/NAK] Failed to send in socket");
+                {
+                    error!("[{:X}] [ACK/NAK] Failed to send in socket: {:?}", transaction_id, e);
+                }
             } else {
                 error!("[ERROR] handling REQUEST {:?}", response);
             }
@@ -439,13 +471,32 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
 
         if options.has_msg_type(MessageType::Decline) {
             let transaction_id = decoded_message.xid();
-            info!("[{:X}] [DECLINE]", transaction_id);
+            let requested_ip = decoded_message.opts().get(OptionCode::RequestedIpAddress);
+
+            if let Some(DhcpOption::RequestedIpAddress(ip)) = requested_ip {
+                info!("[{:X}] [DECLINE] Client declined IP {:?} (address conflict detected)", transaction_id, ip);
+                if let Err(e) = db::mark_ip_declined(&config.leases, *ip).await {
+                    error!("[{:X}] [DECLINE] Failed to mark IP as declined: {:?}", transaction_id, e);
+                } else {
+                    info!("[{:X}] [DECLINE] IP {:?} marked as unavailable", transaction_id, ip);
+                }
+            } else {
+                warn!("[{:X}] [DECLINE] No requested IP in DECLINE message", transaction_id);
+            }
             continue;
         }
 
         if options.has_msg_type(MessageType::Release) {
             let transaction_id = decoded_message.xid();
-            info!("[{:X}] [RELEASE]", transaction_id);
+            let client_id = decoded_message.chaddr().to_vec();
+            let ciaddr = decoded_message.ciaddr();
+
+            info!("[{:X}] [RELEASE] Client releasing IP {:?}", transaction_id, ciaddr);
+            if let Err(e) = db::release_lease(&config.leases, ciaddr, &client_id).await {
+                error!("[{:X}] [RELEASE] Failed to release lease: {:?}", transaction_id, e);
+            } else {
+                info!("[{:X}] [RELEASE] Lease for {:?} released", transaction_id, ciaddr);
+            }
             continue;
         }
         if options.has_msg_type(MessageType::Inform) {
