@@ -78,11 +78,36 @@ async fn build_dhcp_offer_packet(
     // pool of available addresses and not already allocated, ELSE
     let mut suggested_address = match db::get_ip_from_client_id(leases, &client_id).await {
         Ok(address) => {
-            info!(
-                "[OFFER] Client {:?} already has IP assigned: {:?}",
-                client_id, address
-            );
-            Some(address)
+            // Check if this lease has expired
+            match db::get_lease_by_ip(leases, &address).await {
+                Ok(lease) => {
+                    let current_time = Zoned::now().round(Unit::Second)?.timestamp().as_second();
+                    if lease.expires_at < current_time {
+                        // Lease has expired, renew it
+                        let new_expiry = Zoned::now()
+                            .round(Unit::Second)?
+                            .checked_add(1.hour())
+                            .with_context(|| "Failed to calculate lease expiry time".to_string())?
+                            .timestamp()
+                            .as_second();
+                        db::update_lease_expiry(leases, address, new_expiry).await?;
+                        info!(
+                            "[OFFER] Client {:?} has expired lease for {:?}, renewed",
+                            client_id, address
+                        );
+                    } else {
+                        info!(
+                            "[OFFER] Client {:?} already has IP assigned: {:?}",
+                            client_id, address
+                        );
+                    }
+                    Some(address)
+                }
+                Err(_) => {
+                    warn!("[OFFER] Could not fetch lease details for {:?}", address);
+                    Some(address)
+                }
+            }
         }
         _ => {
             warn!(
@@ -255,41 +280,77 @@ async fn build_dhcp_ack_packet(
 
     // 4) Validate that the IP is on the correct subnet (RFC says to NAK if it's on the wrong net).
     //    Also check if you have a valid lease for this client in your DB, etc.
+
+    // First check if IP is in valid range
+    if !check_ip_in_range(*ip_to_validate) {
+        return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
+            request_message,
+            "Requested IP address is outside valid range",
+        )));
+    }
+
     let lease = match db::get_lease_by_ip(leases, ip_to_validate).await {
-        Ok(lease) => lease,
+        Ok(lease) => Some(lease),
+        Err(sqlx::Error::RowNotFound) => {
+            // No lease exists - for INIT-REBOOT state, create one if IP is available
+            if is_init_reboot {
+                // Check if IP is already assigned to someone else
+                if db::is_ip_assigned(leases, *ip_to_validate).await? {
+                    warn!("[ACK] IP {:?} is assigned to another client", ip_to_validate);
+                    return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
+                        request_message,
+                        "IP address is assigned to another client",
+                    )));
+                }
+
+                // IP is available, create a lease for this client
+                info!("[ACK] Creating new lease for {:?} on INIT-REBOOT request", ip_to_validate);
+                insert_lease(leases, *ip_to_validate, &chaddr).await?;
+                None // Will create ACK below
+            } else {
+                warn!("[ACK] NO RECORD FOUND ON DB for non-INIT-REBOOT state");
+                return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
+                    request_message,
+                    "No lease record found in database",
+                )));
+            }
+        }
         Err(e) => {
-            warn!("[ACK] NO RECORD FOUND ON DB {:?}", e);
+            warn!("[ACK] Database error: {:?}", e);
             return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
                 request_message,
-                "No lease record found in database",
+                "Database error",
             )));
         }
     };
 
-    if !lease.leased {
-        return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
-            request_message,
-            "IP address is not currently leased",
-        )));
-    }
+    // Validate the lease if it exists (skip if we just created it)
+    if let Some(lease) = &lease {
+        if !lease.leased {
+            return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
+                request_message,
+                "IP address is not currently leased",
+            )));
+        }
 
-    // Check if lease has expired
-    let current_time = Zoned::now().round(Unit::Second)?.timestamp().as_second();
-    if lease.expires_at < current_time {
-        warn!("[ACK] Lease has expired: expires_at={}, current={}", lease.expires_at, current_time);
-        return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
-            request_message,
-            "Lease has expired",
-        )));
-    }
+        // Check if lease has expired
+        let current_time = Zoned::now().round(Unit::Second)?.timestamp().as_second();
+        if lease.expires_at < current_time {
+            warn!("[ACK] Lease has expired: expires_at={}, current={}", lease.expires_at, current_time);
+            return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
+                request_message,
+                "Lease has expired",
+            )));
+        }
 
-    // Validate that the client_id matches the lease
-    if lease.client_id != chaddr {
-        warn!("[ACK] Client ID mismatch: lease has {:?}, request has {:?}", lease.client_id, chaddr);
-        return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
-            request_message,
-            "IP address is leased to a different client",
-        )));
+        // Validate that the client_id matches the lease
+        if lease.client_id != chaddr {
+            warn!("[ACK] Client ID mismatch: lease has {:?}, request has {:?}", lease.client_id, chaddr);
+            return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
+                request_message,
+                "IP address is leased to a different client",
+            )));
+        }
     }
 
     let mut ack = Message::default();
