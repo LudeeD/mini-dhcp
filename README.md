@@ -63,8 +63,4 @@ The server stores lease information in a CSV file (`leases.csv`) in the current 
 
 This server is designed for **single-server environments** and has known deviations from RFC 2131/2132.
 
-For a complete list of deviations, see [DEVIATIONS.md](DEVIATIONS.md).
-
 **Key intentional deviation:** When a client attempts to renew or rebind a lease that the server has no record of (e.g., after server restart), RFC 2131 specifies the server MUST remain silent. Instead, mini-dhcp accepts the renewal if the IP is available - providing better UX in single-server setups.
-
-If you're running multiple DHCP servers on the same network, this behavior may cause conflicts.
