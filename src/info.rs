@@ -1,8 +1,8 @@
-use crate::{db, Client, MiniDHCPConfiguration};
+use crate::{Client, MiniDHCPConfiguration};
 use tracing::error;
 
 pub async fn get_status(conf: &MiniDHCPConfiguration) -> Vec<Client> {
-    let leases = match db::get_all_leases(&conf.leases).await {
+    let leases = match conf.leases.get_valid_leases().await {
         Ok(leases) => leases,
         Err(e) => {
             error!("Error: {:?}", e);
@@ -13,7 +13,7 @@ pub async fn get_status(conf: &MiniDHCPConfiguration) -> Vec<Client> {
     leases
         .into_iter()
         .map(|lease| Client {
-            ip: std::net::Ipv4Addr::from(lease.ip as u32),
+            ip: lease.ip,
             client_id: hex::encode(lease.client_id),
         })
         .collect()

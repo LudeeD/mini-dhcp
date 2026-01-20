@@ -5,8 +5,8 @@ A lightweight DHCP server implementation in Rust that handles basic DHCP operati
 
 ## Features
 
-- Basic DHCP server functionality (DISCOVER, OFFER, REQUEST, ACK)
-- SQLite-based lease management
+- Basic DHCP server functionality (DISCOVER, OFFER, REQUEST, ACK, NAK)
+- CSV-based lease management (human-readable, easy to inspect/edit)
 - Configurable network interface binding
 - Support for basic DHCP options (subnet mask, router, lease time, etc.)
 - IPv4 address pool management (192.168.1.100-200 range)
@@ -14,7 +14,6 @@ A lightweight DHCP server implementation in Rust that handles basic DHCP operati
 ## Prerequisites
 
 - Rust 1.x
-- SQLite3
 - Root/sudo privileges (required for binding to port 67)
 
 ## Usage
@@ -46,16 +45,26 @@ The DHCP server is configured to:
 - Set lease time to 1 hour (3600 seconds)
 - Use 255.255.255.0 as subnet mask
 
-## Database
+## Lease Storage
 
-The server uses SQLite to store lease information. The database file is automatically created as `dhcp.db` in the current directory.
+The server stores lease information in a CSV file (`leases.csv`) in the current directory. The file is human-readable and can be inspected or edited manually if needed.
 
 ## Supported DHCP Messages
 
 - DISCOVER
 - OFFER
 - REQUEST
-- ACK
-- DECLINE (logged only)
-- RELEASE (logged only)
-- INFORM (logged only)
+- ACK/NAK
+- DECLINE
+- RELEASE
+- INFORM
+
+## RFC 2131 Compliance
+
+This server is designed for **single-server environments** and has known deviations from RFC 2131/2132.
+
+For a complete list of deviations, see [DEVIATIONS.md](DEVIATIONS.md).
+
+**Key intentional deviation:** When a client attempts to renew or rebind a lease that the server has no record of (e.g., after server restart), RFC 2131 specifies the server MUST remain silent. Instead, mini-dhcp accepts the renewal if the IP is available - providing better UX in single-server setups.
+
+If you're running multiple DHCP servers on the same network, this behavior may cause conflicts.

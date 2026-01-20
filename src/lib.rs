@@ -5,24 +5,12 @@ use dhcproto::v4::{
 use jiff::{ToSpan, Unit, Zoned};
 use rand::Rng;
 use serde::Serialize;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use std::net::Ipv4Addr;
-use std::str::FromStr;
-use tokio::net::UdpSocket;
+use std::path::PathBuf;
+use tokio::{net::UdpSocket, sync::mpsc};
 use tracing::{error, info, warn};
-mod db;
+pub mod db;
 pub mod info;
-
-#[allow(dead_code)]
-#[derive(Debug)]
-struct Lease {
-    ip: i64,
-    client_id: Vec<u8>,
-    leased: bool,
-    expires_at: i64,
-    network: i64,
-    probation: bool,
-}
 
 #[derive(Debug, Serialize)]
 pub struct Client {
@@ -40,9 +28,11 @@ fn get_ip_in_range() -> Ipv4Addr {
     Ipv4Addr::new(192, 168, 1, octet)
 }
 
-async fn insert_lease(pool: &SqlitePool, ip: Ipv4Addr, client_id: &Vec<u8>) -> anyhow::Result<()> {
-    let ip = u32::from(ip);
-
+async fn insert_lease(
+    store: &db::LeaseStore,
+    ip: Ipv4Addr,
+    client_id: &Vec<u8>,
+) -> anyhow::Result<()> {
     let expire_at = Zoned::now()
         .round(Unit::Second)?
         .checked_add(1.hour())
@@ -50,22 +40,24 @@ async fn insert_lease(pool: &SqlitePool, ip: Ipv4Addr, client_id: &Vec<u8>) -> a
         .timestamp()
         .as_second();
 
-    sqlx::query_file!(
-        "./db/queries/insert-new-lease.sql",
+    let lease = db::Lease {
         ip,
-        client_id,
-        expire_at,
-        0
-    )
-    .execute(pool)
-    .await?;
+        client_id: client_id.clone(),
+        leased: true,
+        expires_at: expire_at,
+        network: 0,
+        probation: false,
+    };
+
+    store.insert_lease(lease).await?;
     Ok(())
 }
 
 async fn build_dhcp_offer_packet(
-    leases: &SqlitePool,
+    leases: &db::LeaseStore,
     discover_message: &Message,
 ) -> anyhow::Result<Message> {
+    let xid = discover_message.xid();
     let client_id = discover_message.chaddr().to_vec();
 
     // The client's current address as recorded in the client's current
@@ -76,10 +68,10 @@ async fn build_dhcp_offer_packet(
     // The client's previous address as recorded in the client's (now
     // expired or released) binding, if that address is in the server's
     // pool of available addresses and not already allocated, ELSE
-    let mut suggested_address = match db::get_ip_from_client_id(leases, &client_id).await {
+    let mut suggested_address = match leases.get_ip_from_client_id(&client_id).await {
         Ok(address) => {
             // Check if this lease has expired
-            match db::get_lease_by_ip(leases, &address).await {
+            match leases.get_lease_by_ip(&address).await {
                 Ok(lease) => {
                     let current_time = Zoned::now().round(Unit::Second)?.timestamp().as_second();
                     if lease.expires_at < current_time {
@@ -90,28 +82,31 @@ async fn build_dhcp_offer_packet(
                             .with_context(|| "Failed to calculate lease expiry time".to_string())?
                             .timestamp()
                             .as_second();
-                        db::update_lease_expiry(leases, address, new_expiry).await?;
+                        leases.update_lease_expiry(address, new_expiry).await?;
                         info!(
-                            "[OFFER] Client {:?} has expired lease for {:?}, renewed",
+                            "[{xid:X}] [OFFER] Client {:?} has expired lease for {:?}, renewed",
                             client_id, address
                         );
                     } else {
                         info!(
-                            "[OFFER] Client {:?} already has IP assigned: {:?}",
+                            "[{xid:X}] [OFFER] Client {:?} already has IP assigned: {:?}",
                             client_id, address
                         );
                     }
                     Some(address)
                 }
                 Err(_) => {
-                    warn!("[OFFER] Could not fetch lease details for {:?}", address);
+                    warn!(
+                        "[{xid:X}] [OFFER] Could not fetch lease details for {:?}",
+                        address
+                    );
                     Some(address)
                 }
             }
         }
         _ => {
             warn!(
-                "[OFFER] Client {:?} has no IP assigned in the database",
+                "[{xid:X}] [OFFER] Client {:?} has no IP assigned in the database",
                 client_id
             );
             None
@@ -123,37 +118,30 @@ async fn build_dhcp_offer_packet(
     if suggested_address.is_none() {
         let requested_ip_address = discover_message.opts().get(OptionCode::RequestedIpAddress);
         info!(
-            "[OFFER] Client requested IP address: {:?}",
+            "[{xid:X}] [OFFER] Client requested IP address: {:?}",
             requested_ip_address
         );
         match requested_ip_address {
             Some(DhcpOption::RequestedIpAddress(ip)) => {
-                if !db::is_ip_assigned(leases, *ip).await? && check_ip_in_range(*ip) {
+                if !leases.is_ip_assigned(*ip).await? && check_ip_in_range(*ip) {
+                    insert_lease(leases, *ip, &client_id).await?;
                     suggested_address = Some(*ip);
                 }
             }
             _ => {
-                warn!("[OFFER] No requested IP address")
+                warn!("[{xid:X}] [OFFER] No requested IP address")
             }
         };
     }
 
+    // A new address allocated from the server's pool of available addresses
     if suggested_address.is_none() {
-        let mut max_tries: u8 = 10;
-        loop {
+        for _ in 0..10 {
             let random_address = get_ip_in_range();
-
-            if !db::is_ip_assigned(leases, random_address).await? {
-                suggested_address = Some(random_address);
-                // insert the lease into the database
+            if !leases.is_ip_assigned(random_address).await? {
                 insert_lease(leases, random_address, &client_id).await?;
+                suggested_address = Some(random_address);
                 break;
-            }
-
-            if max_tries == 0 {
-                return Err(anyhow::anyhow!("Could not assign IP address"));
-            } else {
-                max_tries = max_tries.saturating_sub(1);
             }
         }
     }
@@ -163,7 +151,10 @@ async fn build_dhcp_offer_packet(
         None => return Err(anyhow::anyhow!("Could not assign IP address")),
     };
 
-    info!("[OFFER] creating offer with IP {}", suggested_address);
+    info!(
+        "[{xid:X}] [OFFER] Creating offer with IP {}",
+        suggested_address
+    );
 
     let mut offer = Message::default();
 
@@ -205,7 +196,8 @@ enum DhcpResponse {
 
 /// Build a DHCP NAK packet according to RFC 2131 Table 3
 fn build_dhcp_nack_packet(request_message: &Message, reason: &str) -> Message {
-    info!("[NAK] Sending NACK: {}", reason);
+    let xid = request_message.xid();
+    info!("[{xid:X}] [NAK] Sending: {}", reason);
 
     let mut nak = Message::default();
     nak.set_opcode(Opcode::BootReply);
@@ -227,9 +219,10 @@ fn build_dhcp_nack_packet(request_message: &Message, reason: &str) -> Message {
 }
 
 async fn build_dhcp_ack_packet(
-    leases: &SqlitePool,
+    leases: &db::LeaseStore,
     request_message: &Message,
 ) -> anyhow::Result<DhcpResponse> {
+    let xid = request_message.xid();
     let server_identifier_option = request_message.opts().get(OptionCode::ServerIdentifier);
 
     let requested_ip_option = request_message.opts().get(OptionCode::RequestedIpAddress);
@@ -258,7 +251,7 @@ async fn build_dhcp_ack_packet(
     let ip_to_validate = if is_selecting || is_init_reboot {
         match requested_ip_option {
             Some(DhcpOption::RequestedIpAddress(ip)) => {
-                info!("[ACK] Client requested IP address: {:?}", ip);
+                info!("[{xid:X}] [ACK] Client requested IP address: {:?}", ip);
                 ip
             }
             _ => {
@@ -269,7 +262,7 @@ async fn build_dhcp_ack_packet(
             }
         }
     } else if is_renewing_rebinding {
-        info!("[ACK] using ciaddr {:?}", ciaddr);
+        info!("[{xid:X}] [ACK] Using ciaddr {:?}", ciaddr);
         &ciaddr
     } else {
         return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
@@ -289,34 +282,33 @@ async fn build_dhcp_ack_packet(
         )));
     }
 
-    let lease = match db::get_lease_by_ip(leases, ip_to_validate).await {
+    let lease = match leases.get_lease_by_ip(ip_to_validate).await {
         Ok(lease) => Some(lease),
-        Err(sqlx::Error::RowNotFound) => {
-            // No lease exists - for INIT-REBOOT state, create one if IP is available
-            if is_init_reboot {
-                // Check if IP is already assigned to someone else
-                if db::is_ip_assigned(leases, *ip_to_validate).await? {
-                    warn!("[ACK] IP {:?} is assigned to another client", ip_to_validate);
-                    return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
-                        request_message,
-                        "IP address is assigned to another client",
-                    )));
-                }
-
-                // IP is available, create a lease for this client
-                info!("[ACK] Creating new lease for {:?} on INIT-REBOOT request", ip_to_validate);
-                insert_lease(leases, *ip_to_validate, &chaddr).await?;
-                None // Will create ACK below
-            } else {
-                warn!("[ACK] NO RECORD FOUND ON DB for non-INIT-REBOOT state");
+        Err(db::LeaseError::NotFound) => {
+            // No lease exists - check if IP is already assigned to someone else
+            if leases.is_ip_assigned(*ip_to_validate).await? {
+                warn!(
+                    "[{xid:X}] [ACK] IP {:?} is assigned to another client",
+                    ip_to_validate
+                );
                 return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
                     request_message,
-                    "No lease record found in database",
+                    "IP address is assigned to another client",
                 )));
             }
+
+            // Lenient mode: accept the client's claimed IP if it's in range and available.
+            // This deviates from RFC 2131 which says to remain silent when we have no record,
+            // but provides better UX for single-server setups (e.g., after server restart).
+            info!(
+                "[{xid:X}] [ACK] No lease record found, creating lease for {:?}",
+                ip_to_validate
+            );
+            insert_lease(leases, *ip_to_validate, &chaddr).await?;
+            None
         }
         Err(e) => {
-            warn!("[ACK] Database error: {:?}", e);
+            warn!("[{xid:X}] [ACK] Database error: {:?}", e);
             return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
                 request_message,
                 "Database error",
@@ -336,7 +328,10 @@ async fn build_dhcp_ack_packet(
         // Check if lease has expired
         let current_time = Zoned::now().round(Unit::Second)?.timestamp().as_second();
         if lease.expires_at < current_time {
-            warn!("[ACK] Lease has expired: expires_at={}, current={}", lease.expires_at, current_time);
+            warn!(
+                "[{xid:X}] [ACK] Lease has expired: expires_at={}, current={}",
+                lease.expires_at, current_time
+            );
             return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
                 request_message,
                 "Lease has expired",
@@ -345,7 +340,10 @@ async fn build_dhcp_ack_packet(
 
         // Validate that the client_id matches the lease
         if lease.client_id != chaddr {
-            warn!("[ACK] Client ID mismatch: lease has {:?}, request has {:?}", lease.client_id, chaddr);
+            warn!(
+                "[{xid:X}] [ACK] Client ID mismatch: lease has {:?}, request has {:?}",
+                lease.client_id, chaddr
+            );
             return Ok(DhcpResponse::Nak(build_dhcp_nack_packet(
                 request_message,
                 "IP address is leased to a different client",
@@ -383,7 +381,9 @@ async fn build_dhcp_ack_packet(
         .timestamp()
         .as_second();
 
-    db::update_lease_expiry(leases, *ip_to_validate, new_expiry).await?;
+    leases
+        .update_lease_expiry(*ip_to_validate, new_expiry)
+        .await?;
 
     Ok(DhcpResponse::Ack(ack))
 }
@@ -391,18 +391,47 @@ async fn build_dhcp_ack_packet(
 #[derive(Clone)]
 pub struct MiniDHCPConfiguration {
     interface: String,
-    leases: SqlitePool,
+    event_queue: Vec<mpsc::Sender<String>>,
+    pub leases: db::LeaseStore,
 }
 
-impl MiniDHCPConfiguration {
-    pub async fn new(interface: String) -> anyhow::Result<Self> {
-        let conn = SqliteConnectOptions::from_str("sqlite://dhcp.db")?.create_if_missing(true);
+pub struct MiniDHCPConfigurationBuilder {
+    interface: Option<String>,
+    event_queue: Vec<mpsc::Sender<String>>,
+}
 
-        let leases = SqlitePool::connect_with(conn).await?;
+impl MiniDHCPConfigurationBuilder {
+    pub fn new() -> MiniDHCPConfigurationBuilder {
+        Self {
+            interface: None,
+            event_queue: Vec::new(),
+        }
+    }
 
-        sqlx::migrate!("./db/migrations").run(&leases).await?;
+    pub fn set_listening_interface(mut self, interface: &str) -> Self {
+        self.interface = Some(interface.into());
+        self
+    }
 
-        Ok(Self { leases, interface })
+    pub fn set_event_queue(mut self, event_queue: mpsc::Sender<String>) -> Self {
+        self.event_queue.push(event_queue);
+        self
+    }
+
+    pub async fn build(self) -> anyhow::Result<MiniDHCPConfiguration> {
+        let interface = self
+            .interface
+            .ok_or_else(|| anyhow::anyhow!("Interface not set"))?;
+
+        let leases = db::LeaseStore::new(PathBuf::from("leases.csv")).await?;
+
+        let event_queue = self.event_queue;
+
+        Ok(MiniDHCPConfiguration {
+            interface,
+            leases,
+            event_queue,
+        })
     }
 }
 
@@ -457,6 +486,12 @@ async fn handle_request(
                 transaction_id, client_address, offered_ip
             );
 
+            // Send notification to event queue
+            for sender in &config.event_queue {
+                let msg = format!("NEW_LEASE: {} -> {:?}", offered_ip, client_address);
+                let _ = sender.try_send(msg);
+            }
+
             let mut buf = Vec::new();
             let mut e = Encoder::new(&mut buf);
             ack.encode(&mut e)?;
@@ -501,11 +536,11 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
             let response = handle_discover(&config, &decoded_message).await;
             if let Ok(response) = response {
                 info!("[{:X}] [OFFER] Sending...", transaction_id);
-                if let Err(e) = socket
-                    .send_to(&response, "255.255.255.255:68")
-                    .await
-                {
-                    error!("[{:X}] [OFFER] Failed to send in socket: {:?}", transaction_id, e);
+                if let Err(e) = socket.send_to(&response, "255.255.255.255:68").await {
+                    error!(
+                        "[{:X}] [OFFER] Failed to send in socket: {:?}",
+                        transaction_id, e
+                    );
                 }
             } else {
                 error!("[ERROR] handling DISCOVER {:?}", response);
@@ -518,11 +553,11 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
             let response = handle_request(&config, &decoded_message).await;
             if let Ok(response) = response {
                 info!("[{:X}] [ACK/NAK] Sending...", transaction_id);
-                if let Err(e) = socket
-                    .send_to(&response, "255.255.255.255:68")
-                    .await
-                {
-                    error!("[{:X}] [ACK/NAK] Failed to send in socket: {:?}", transaction_id, e);
+                if let Err(e) = socket.send_to(&response, "255.255.255.255:68").await {
+                    error!(
+                        "[{:X}] [ACK/NAK] Failed to send in socket: {:?}",
+                        transaction_id, e
+                    );
                 }
             } else {
                 error!("[ERROR] handling REQUEST {:?}", response);
@@ -535,14 +570,26 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
             let requested_ip = decoded_message.opts().get(OptionCode::RequestedIpAddress);
 
             if let Some(DhcpOption::RequestedIpAddress(ip)) = requested_ip {
-                info!("[{:X}] [DECLINE] Client declined IP {:?} (address conflict detected)", transaction_id, ip);
-                if let Err(e) = db::mark_ip_declined(&config.leases, *ip).await {
-                    error!("[{:X}] [DECLINE] Failed to mark IP as declined: {:?}", transaction_id, e);
+                info!(
+                    "[{:X}] [DECLINE] Client declined IP {:?} (address conflict detected)",
+                    transaction_id, ip
+                );
+                if let Err(e) = config.leases.mark_ip_declined(*ip).await {
+                    error!(
+                        "[{:X}] [DECLINE] Failed to mark IP as declined: {:?}",
+                        transaction_id, e
+                    );
                 } else {
-                    info!("[{:X}] [DECLINE] IP {:?} marked as unavailable", transaction_id, ip);
+                    info!(
+                        "[{:X}] [DECLINE] IP {:?} marked as unavailable",
+                        transaction_id, ip
+                    );
                 }
             } else {
-                warn!("[{:X}] [DECLINE] No requested IP in DECLINE message", transaction_id);
+                warn!(
+                    "[{:X}] [DECLINE] No requested IP in DECLINE message",
+                    transaction_id
+                );
             }
             continue;
         }
@@ -552,11 +599,20 @@ pub async fn start(config: MiniDHCPConfiguration) -> anyhow::Result<()> {
             let client_id = decoded_message.chaddr().to_vec();
             let ciaddr = decoded_message.ciaddr();
 
-            info!("[{:X}] [RELEASE] Client releasing IP {:?}", transaction_id, ciaddr);
-            if let Err(e) = db::release_lease(&config.leases, ciaddr, &client_id).await {
-                error!("[{:X}] [RELEASE] Failed to release lease: {:?}", transaction_id, e);
+            info!(
+                "[{:X}] [RELEASE] Client releasing IP {:?}",
+                transaction_id, ciaddr
+            );
+            if let Err(e) = config.leases.release_lease(ciaddr, &client_id).await {
+                error!(
+                    "[{:X}] [RELEASE] Failed to release lease: {:?}",
+                    transaction_id, e
+                );
             } else {
-                info!("[{:X}] [RELEASE] Lease for {:?} released", transaction_id, ciaddr);
+                info!(
+                    "[{:X}] [RELEASE] Lease for {:?} released",
+                    transaction_id, ciaddr
+                );
             }
             continue;
         }
