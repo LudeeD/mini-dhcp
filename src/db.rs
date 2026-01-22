@@ -1,3 +1,4 @@
+use crate::migration::{maybe_migrate, MigrationResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -5,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 #[derive(Error, Debug)]
 pub enum LeaseError {
@@ -90,6 +92,22 @@ pub struct LeaseStore {
 
 impl LeaseStore {
     pub async fn new(file_path: PathBuf) -> Result<Self, LeaseError> {
+        // Attempt migration from SQLite if needed
+        match maybe_migrate(&file_path) {
+            MigrationResult::Migrated(count) => {
+                info!("Migrated {} leases from SQLite to CSV", count);
+            }
+            MigrationResult::Skipped => {
+                info!("Migration skipped: CSV file already exists");
+            }
+            MigrationResult::NoDatabase => {
+                info!("No SQLite database found, starting fresh");
+            }
+            MigrationResult::Failed(err) => {
+                warn!("Migration failed: {}. Starting with empty lease store.", err);
+            }
+        }
+
         let leases = if file_path.exists() {
             Self::load_from_csv(&file_path)?
         } else {
