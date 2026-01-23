@@ -11,6 +11,7 @@ use tokio::{net::UdpSocket, sync::mpsc};
 use tracing::{error, info, warn};
 pub mod db;
 pub mod info;
+pub mod migration;
 
 #[derive(Debug, Serialize)]
 pub struct Client {

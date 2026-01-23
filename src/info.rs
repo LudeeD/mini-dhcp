@@ -1,14 +1,16 @@
 use crate::{Client, MiniDHCPConfiguration};
-use tracing::error;
+use tracing::{error, info};
 
 pub async fn get_status(conf: &MiniDHCPConfiguration) -> Vec<Client> {
-    let leases = match conf.leases.get_valid_leases().await {
+    let leases = match conf.leases.get_all_leases().await {
         Ok(leases) => leases,
         Err(e) => {
             error!("Error: {:?}", e);
             Vec::new()
         }
     };
+
+    info!("Number of leases: {}", leases.len());
 
     leases
         .into_iter()
